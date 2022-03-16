@@ -48,6 +48,7 @@
 #include <atomic>
 #include <list>
 #include <string>
+#include <benchmark/benchmark.h>
 
 #if !defined(linux)
 #include <sys/lock.h>
@@ -1726,515 +1727,74 @@ bind_outputs(const char *bind_stdout_p, const char *bind_stderr_p)
 // Main
 //
 
-int
-main(int /* argc ATS_UNUSED */, const char **argv)
+
+constexpr int len = 6;
+
+// constexpr function具有inline属性，你应该把它放在头文件中
+constexpr auto my_pow(const int i)
 {
-#if TS_HAS_PROFILER
-  HeapProfilerStart("/tmp/ts.hprof");
-  ProfilerStart("/tmp/ts.prof");
-#endif
-  bool admin_user_p = false;
-
-#if defined(DEBUG) && defined(HAVE_MCHECK_PEDANTIC)
-  mcheck_pedantic(NULL);
-#endif
-
-  pcre_malloc = ats_malloc;
-  pcre_free   = ats_free;
-
-  // Define the version info
-  appVersionInfo.setup(PACKAGE_NAME, "traffic_server", PACKAGE_VERSION, __DATE__, __TIME__, BUILD_MACHINE, BUILD_PERSON, "");
-
-  runroot_handler(argv);
-  // Before accessing file system initialize Layout engine
-  Layout::create();
-  // Let's be clear on what exactly is starting up.
-  printf("Traffic Server " PACKAGE_VERSION BUILD_NUMBER " " __DATE__ " " __TIME__ " " BUILD_MACHINE "\n");
-  chdir_root(); // change directory to the install root of traffic server.
-
-  std::sort(argument_descriptions, argument_descriptions + countof(argument_descriptions),
-            [](ArgumentDescription const &a, ArgumentDescription const &b) { return 0 > strcasecmp(a.name, b.name); });
-
-  process_args(&appVersionInfo, argument_descriptions, countof(argument_descriptions), argv);
-  command_flag  = command_flag || *command_string;
-  command_index = find_cmd_index(command_string);
-  command_valid = command_flag && command_index >= 0;
-
-  // Attach point when TS is blocked for debugging is in this loop.
-  //
-  while (cmd_block) {
-    sleep(1);
-  }
-
-  ink_freelist_init_ops(cmd_disable_freelist, cmd_disable_pfreelist);
-
-#if TS_HAS_TESTS
-  if (regression_list) {
-    RegressionTest::list();
-    ::exit(0);
-  }
-#endif
-
-  // Bootstrap syslog.  Since we haven't read records.config
-  //   yet we do not know where
-  openlog("traffic_server", LOG_PID | LOG_NDELAY | LOG_NOWAIT, LOG_DAEMON);
-
-  // Setup Diags temporary to allow librecords to be initialized.
-  // We will re-configure Diags again with proper configurations after
-  // librecords initialized. This is needed because:
-  //   - librecords needs diags to initialize
-  //   - diags needs to read some configuration records to initial
-  // We cannot mimic whatever TM did (start Diag, init. librecords, and
-  // re-start Diag completely) because at initialize, TM only has 1 thread.
-  // In TS, some threads have already created, so if we delete Diag and
-  // re-start it again, TS will crash.
-  // This is also needed for log rotation - setting up the file can cause privilege
-  // related errors and if diagsConfig isn't get up yet that will crash on a NULL pointer.
-  diagsConfig = new DiagsConfig("Server", DEFAULT_DIAGS_LOG_FILENAME, error_tags, action_tags, false);
-  diags->set_std_output(StdStream::STDOUT, bind_stdout);
-  diags->set_std_output(StdStream::STDERR, bind_stderr);
-  if (is_debug_tag_set("diags")) {
-    diags->dump();
-  }
-
-  // Bind stdout and stderr to specified switches
-  // Still needed despite the set_std{err,out}_output() calls later since there are
-  // fprintf's before those calls
-  bind_outputs(bind_stdout, bind_stderr);
-
-  // Local process manager
-  initialize_process_manager();
-
-  // Set the core limit for the process
-  init_core_size();
-  init_system();
-
-  // Adjust system and process settings
-  adjust_sys_settings();
-
-  // Restart syslog now that we have configuration info
-  syslog_log_configure();
-
-  // Register stats if standalone
-  if (DEFAULT_REMOTE_MANAGEMENT_FLAG == remote_management_flag) {
-    RecRegisterStatInt(RECT_NODE, "proxy.node.config.reconfigure_time", time(nullptr), RECP_NON_PERSISTENT);
-    RecRegisterStatInt(RECT_NODE, "proxy.node.config.reconfigure_required", 0, RECP_NON_PERSISTENT);
-    RecRegisterStatInt(RECT_NODE, "proxy.node.config.restart_required.proxy", 0, RECP_NON_PERSISTENT);
-    RecRegisterStatInt(RECT_NODE, "proxy.node.config.restart_required.manager", 0, RECP_NON_PERSISTENT);
-    RecRegisterStatInt(RECT_NODE, "proxy.node.config.draining", 0, RECP_NON_PERSISTENT);
-  }
-
-  // init huge pages
-  int enabled;
-  REC_ReadConfigInteger(enabled, "proxy.config.allocator.hugepages");
-  ats_hugepage_init(enabled);
-  Debug("hugepages", "ats_pagesize reporting %zu", ats_pagesize());
-  Debug("hugepages", "ats_hugepage_size reporting %zu", ats_hugepage_size());
-
-  if (!num_accept_threads) {
-    REC_ReadConfigInteger(num_accept_threads, "proxy.config.accept_threads");
-  }
-
-  if (!num_task_threads) {
-    REC_ReadConfigInteger(num_task_threads, "proxy.config.task_threads");
-  }
-
-  ats_scoped_str user(MAX_LOGIN + 1);
-
-  *user        = '\0';
-  admin_user_p = ((REC_ERR_OKAY == REC_ReadConfigString(user, "proxy.config.admin.user_id", MAX_LOGIN)) && (*user != '\0') &&
-                  (0 != strcmp(user, "#-1")));
-
-  // Set up crash logging. We need to do this while we are still privileged so that the crash
-  // logging helper runs as root. Don't bother setting up a crash logger if we are going into
-  // command mode since that's not going to daemonize or run for a long time unattended.
-  if (!command_flag) {
-    crash_logger_init(user);
-    signal_register_crash_handler(crash_logger_invoke);
-  }
-
-#if TS_USE_POSIX_CAP
-  // Change the user of the process.
-  // Do this before we start threads so we control the user id of the
-  // threads (rather than have it change asynchronously during thread
-  // execution). We also need to do this before we fiddle with capabilities
-  // as those are thread local and if we change the user id it will
-  // modify the capabilities in other threads, breaking things.
-  if (admin_user_p) {
-    PreserveCapabilities();
-    change_uid_gid(user);
-    RestrictCapabilities();
-  }
-#endif
-
-  // Ensure only one copy of traffic server is running, unless it's a command
-  // that doesn't require a lock.
-  if (!(command_valid && commands[command_index].no_process_lock)) {
-    check_lockfile();
-  }
-
-  // Can't generate a log message yet, do that right after Diags is
-  // setup.
-
-  // This call is required for win_9xMe
-  // without this this_ethread() is failing when
-  // start_HttpProxyServer is called from main thread
-  Thread *main_thread = new EThread;
-  main_thread->set_specific();
-
-  // Re-initialize diagsConfig based on records.config configuration
-  REC_ReadConfigString(diags_log_filename, "proxy.config.diags.logfile.filename", sizeof(diags_log_filename));
-  if (strnlen(diags_log_filename, sizeof(diags_log_filename)) == 0) {
-    strncpy(diags_log_filename, DEFAULT_DIAGS_LOG_FILENAME, sizeof(diags_log_filename));
-  }
-  DiagsConfig *old_log = diagsConfig;
-  diagsConfig          = new DiagsConfig("Server", diags_log_filename, error_tags, action_tags, true);
-  RecSetDiags(diags);
-  diags->set_std_output(StdStream::STDOUT, bind_stdout);
-  diags->set_std_output(StdStream::STDERR, bind_stderr);
-  if (is_debug_tag_set("diags")) {
-    diags->dump();
-  }
-
-  if (old_log) {
-    delete (old_log);
-    old_log = nullptr;
-  }
-
-  DebugCapabilities("privileges"); // Can do this now, logging is up.
-
-// Check if we should do mlockall()
-#if defined(MCL_FUTURE)
-  int mlock_flags = 0;
-  REC_ReadConfigInteger(mlock_flags, "proxy.config.mlock_enabled");
-
-  if (mlock_flags == 2) {
-    if (0 != mlockall(MCL_CURRENT | MCL_FUTURE)) {
-      Warning("Unable to mlockall() on startup");
-    } else {
-      Debug("server", "Successfully called mlockall()");
-    }
-  }
-#endif
-
-  // setup callback for tracking remap included files
-  load_remap_file_cb = load_config_file_callback;
-
-  // We need to do this early so we can initialize the Machine
-  // singleton, which depends on configuration values loaded in this.
-  // We want to initialize Machine as early as possible because it
-  // has other dependencies. Hopefully not in prep_HttpProxyServer().
-  HttpConfig::startup();
-#if TS_USE_QUIC == 1
-  Http3Config::startup();
-#endif
-
-  /* Set up the machine with the outbound address if that's set,
-     or the inbound address if set, otherwise let it default.
-  */
-  IpEndpoint machine_addr;
-  ink_zero(machine_addr);
-  if (HttpConfig::m_master.outbound_ip4.isValid()) {
-    machine_addr.assign(HttpConfig::m_master.outbound_ip4);
-  } else if (HttpConfig::m_master.outbound_ip6.isValid()) {
-    machine_addr.assign(HttpConfig::m_master.outbound_ip6);
-  } else if (HttpConfig::m_master.inbound_ip4.isValid()) {
-    machine_addr.assign(HttpConfig::m_master.inbound_ip4);
-  } else if (HttpConfig::m_master.inbound_ip6.isValid()) {
-    machine_addr.assign(HttpConfig::m_master.inbound_ip6);
-  }
-  char *hostname = REC_ConfigReadString("proxy.config.log.hostname");
-  if (hostname != nullptr && std::string_view(hostname) == "localhost") {
-    // The default value was used. Let Machine::init derive the hostname.
-    hostname = nullptr;
-  }
-  Machine::init(hostname, &machine_addr.sa);
-  ats_free(hostname);
-
-  RecRegisterStatString(RECT_PROCESS, "proxy.process.version.server.uuid", (char *)Machine::instance()->uuid.getString(),
-                        RECP_NON_PERSISTENT);
-
-  // pmgmt->start() must occur after initialization of Diags but
-  // before calling RecProcessInit()
-
-  REC_ReadConfigInteger(res_track_memory, "proxy.config.res_track_memory");
-
-  init_http_header();
-  ts_session_protocol_well_known_name_indices_init();
-
-  // Sanity checks
-  check_fd_limit();
-
-// Alter the frequencies at which the update threads will trigger
-#define SET_INTERVAL(scope, name, var)                    \
-  do {                                                    \
-    RecInt tmpint;                                        \
-    Debug("statsproc", "Looking for %s", name);           \
-    if (RecGetRecordInt(name, &tmpint) == REC_ERR_OKAY) { \
-      Debug("statsproc", "Found %s", name);               \
-      scope##_set_##var(tmpint);                          \
-    }                                                     \
-  } while (0)
-  SET_INTERVAL(RecProcess, "proxy.config.config_update_interval_ms", config_update_interval_ms);
-  SET_INTERVAL(RecProcess, "proxy.config.raw_stat_sync_interval_ms", raw_stat_sync_interval_ms);
-  SET_INTERVAL(RecProcess, "proxy.config.remote_sync_interval_ms", remote_sync_interval_ms);
-
-  // Initialize the stat pages manager
-  statPagesManager.init();
-
-  num_of_net_threads = adjust_num_of_net_threads(num_of_net_threads);
-
-  size_t stacksize;
-  REC_ReadConfigInteger(stacksize, "proxy.config.thread.default.stacksize");
-
-  // This has some special semantics, in that providing this configuration on
-  // command line has higher priority than what is set in records.config.
-  if (-1 != poll_timeout) {
-    net_config_poll_timeout = poll_timeout;
-  } else {
-    REC_ReadConfigInteger(net_config_poll_timeout, "proxy.config.net.poll_timeout");
-  }
-
-  // This shouldn't happen, but lets make sure we run somewhat reasonable.
-  if (net_config_poll_timeout < 0) {
-    net_config_poll_timeout = 10; // Default value for all platform.
-  }
-
-  REC_ReadConfigInteger(thread_max_heartbeat_mseconds, "proxy.config.thread.max_heartbeat_mseconds");
-
-  ink_event_system_init(ts::ModuleVersion(1, 0, ts::ModuleVersion::PRIVATE));
-  ink_net_init(ts::ModuleVersion(1, 0, ts::ModuleVersion::PRIVATE));
-  ink_aio_init(ts::ModuleVersion(1, 0, ts::ModuleVersion::PRIVATE));
-  ink_cache_init(ts::ModuleVersion(1, 0, ts::ModuleVersion::PRIVATE));
-  ink_hostdb_init(
-    ts::ModuleVersion(HOSTDB_MODULE_INTERNAL_VERSION._major, HOSTDB_MODULE_INTERNAL_VERSION._minor, ts::ModuleVersion::PRIVATE));
-  ink_dns_init(
-    ts::ModuleVersion(HOSTDB_MODULE_INTERNAL_VERSION._major, HOSTDB_MODULE_INTERNAL_VERSION._minor, ts::ModuleVersion::PRIVATE));
-  ink_split_dns_init(ts::ModuleVersion(1, 0, ts::ModuleVersion::PRIVATE));
-
-  naVecMutex = new_ProxyMutex();
-
-  // Do the inits for NetProcessors that use ET_NET threads. MUST be before starting those threads.
-  netProcessor.init();
-  prep_HttpProxyServer();
-
-#if TS_USE_QUIC == 1
-  // OK, pushing a spawn scheduling here
-  quic_NetProcessor.init();
-#endif
-
-  // If num_accept_threads == 0, let the ET_NET threads set the condition variable,
-  // Else we set it here so when checking the condition variable later it returns immediately.
-  if (num_accept_threads == 0 || command_flag) {
-    eventProcessor.thread_group[ET_NET]._afterStartCallback = init_HttpProxyServer;
-  } else {
-    std::unique_lock<std::mutex> lock(proxyServerMutex);
-    et_net_threads_ready = true;
-    lock.unlock();
-    proxyServerCheck.notify_one();
-  }
-
-  // !! ET_NET threads start here !!
-  // This means any spawn scheduling must be done before this point.
-  eventProcessor.start(num_of_net_threads, stacksize);
-
-  eventProcessor.schedule_every(new SignalContinuation, HRTIME_MSECOND * 500, ET_CALL);
-  eventProcessor.schedule_every(new DiagsLogContinuation, HRTIME_SECOND, ET_TASK);
-  eventProcessor.schedule_every(new MemoryLimit, HRTIME_SECOND * 10, ET_TASK);
-  REC_RegisterConfigUpdateFunc("proxy.config.dump_mem_info_frequency", init_memory_tracker, nullptr);
-  init_memory_tracker(nullptr, RECD_NULL, RecData(), nullptr);
-
-  char *p = REC_ConfigReadString("proxy.config.diags.debug.client_ip");
-  if (p) {
-    // Translate string to IpAddr
-    set_debug_ip(p);
-  }
-  REC_RegisterConfigUpdateFunc("proxy.config.diags.debug.client_ip", update_debug_client_ip, nullptr);
-
-  // log initialization moved down
-
-  if (command_flag) {
-    int cmd_ret = cmd_mode();
-
-    if (cmd_ret != CMD_IN_PROGRESS) {
-      // Check the condition variable.
-      {
-        std::unique_lock<std::mutex> lock(proxyServerMutex);
-        proxyServerCheck.wait(lock, [] { return et_net_threads_ready; });
-      }
-
-      if (cmd_ret >= 0) {
-        ::exit(0); // everything is OK
-      } else {
-        ::exit(1); // in error
-      }
-    }
-  } else {
-    RecProcessStart();
-    initCacheControl();
-    IpAllow::startup();
-    HostStatus::instance().loadHostStatusFromStats();
-    netProcessor.init_socks();
-    ParentConfig::startup();
-    SplitDNSConfig::startup();
-
-    // Initialize HTTP/2
-    Http2::init();
-#if TS_USE_QUIC == 1
-    // Initialize HTTP/QUIC
-    Http3::init();
-#endif
-
-    if (!HttpProxyPort::loadValue(http_accept_port_descriptor)) {
-      HttpProxyPort::loadConfig();
-    }
-    HttpProxyPort::loadDefaultIfEmpty();
-
-    dnsProcessor.start(0, stacksize);
-    if (hostDBProcessor.start() < 0)
-      SignalWarning(MGMT_SIGNAL_SYSTEM_ERROR, "bad hostdb or storage configuration, hostdb disabled");
-
-    // initialize logging (after event and net processor)
-    Log::init(remote_management_flag ? 0 : Log::NO_REMOTE_MANAGEMENT);
-
-    (void)parsePluginConfig();
-
-    // Init plugins as soon as logging is ready.
-    (void)plugin_init(); // plugin.config
-
-    SSLConfigParams::init_ssl_ctx_cb  = init_ssl_ctx_callback;
-    SSLConfigParams::load_ssl_file_cb = load_ssl_file_callback;
-    sslNetProcessor.start(-1, stacksize);
-#if TS_USE_QUIC == 1
-    quic_NetProcessor.start(-1, stacksize);
-#endif
-    pmgmt->registerPluginCallbacks(global_config_cbs);
-
-    cacheProcessor.afterInitCallbackSet(&CB_After_Cache_Init);
-    cacheProcessor.start();
-
-    // UDP net-threads are turned off by default.
-    if (!num_of_udp_threads) {
-      REC_ReadConfigInteger(num_of_udp_threads, "proxy.config.udp.threads");
-    }
-    if (num_of_udp_threads) {
-      udpNet.start(num_of_udp_threads, stacksize);
-      eventProcessor.thread_group[ET_UDP]._afterStartCallback = init_HttpProxyServer;
-    }
-
-    // Initialize Response Body Factory
-    body_factory = new HttpBodyFactory;
-
-    // Continuation Statistics Dump
-    if (show_statistics) {
-      eventProcessor.schedule_every(new ShowStats(), HRTIME_SECONDS(show_statistics), ET_CALL);
-    }
-
-    //////////////////////////////////////
-    // main server logic initiated here //
-    //////////////////////////////////////
-
-    init_accept_HttpProxyServer(num_accept_threads);
-    transformProcessor.start();
-
-    int http_enabled = 1;
-    REC_ReadConfigInteger(http_enabled, "proxy.config.http.enabled");
-
-    if (http_enabled) {
-      // call the ready hooks before we start accepting connections.
-      APIHook *hook = lifecycle_hooks->get(TS_LIFECYCLE_PORTS_INITIALIZED_HOOK);
-      while (hook) {
-        hook->invoke(TS_EVENT_LIFECYCLE_PORTS_INITIALIZED, nullptr);
-        hook = hook->next();
-      }
-
-      int delay_p = 0;
-      REC_ReadConfigInteger(delay_p, "proxy.config.http.wait_for_cache");
-
-      // Check the condition variable.
-      {
-        std::unique_lock<std::mutex> lock(proxyServerMutex);
-        proxyServerCheck.wait(lock, [] { return et_net_threads_ready; });
-      }
-
-#if TS_USE_QUIC == 1
-      if (num_of_udp_threads) {
-        std::unique_lock<std::mutex> lock(etUdpMutex);
-        etUdpCheck.wait(lock, [] { return et_udp_threads_ready; });
-      }
-#endif
-      // Delay only if config value set and flag value is zero
-      // (-1 => cache already initialized)
-      if (delay_p && ink_atomic_cas(&delay_listen_for_cache, 0, 1)) {
-        Debug("http_listen", "Delaying listen, waiting for cache initialization");
-      } else {
-        // If we've come here, either:
-        //
-        // 1. The user did not configure wait_for_cache, and/or
-        // 2. The previous delay_listen_for_cache value was not 0, thus the cache
-        //    must have been initialized already.
-        //
-        // In either case we should not delay to accept the ports.
-        Debug("http_listen", "Not delaying listen");
-        start_HttpProxyServer(); // PORTS_READY_HOOK called from in here
-        emit_fully_initialized_message();
-      }
-    }
-    // Plugins can register their own configuration names so now after they've done that
-    // check for unexpected names. This is very late because remap plugins must be allowed to
-    // fire up as well.
-    RecConfigWarnIfUnregistered();
-
-    // "Task" processor, possibly with its own set of task threads
-    tasksProcessor.register_event_type();
-    eventProcessor.thread_group[ET_TASK]._afterStartCallback = task_threads_started_callback;
-    tasksProcessor.start(num_task_threads, stacksize);
-
-    if (netProcessor.socks_conf_stuff->accept_enabled) {
-      start_SocksProxy(netProcessor.socks_conf_stuff->accept_port);
-    }
-
-    pmgmt->registerMgmtCallback(MGMT_EVENT_SHUTDOWN, &mgmt_restart_shutdown_callback);
-    pmgmt->registerMgmtCallback(MGMT_EVENT_RESTART, &mgmt_restart_shutdown_callback);
-    pmgmt->registerMgmtCallback(MGMT_EVENT_DRAIN, &mgmt_drain_callback);
-
-    // Callback for various storage commands. These all go to the same function so we
-    // pass the event code along so it can do the right thing. We cast that to <int> first
-    // just to be safe because the value is a #define, not a typed value.
-    pmgmt->registerMgmtCallback(MGMT_EVENT_STORAGE_DEVICE_CMD_OFFLINE, [](ts::MemSpan<void> span) -> void {
-      mgmt_storage_device_cmd_callback(MGMT_EVENT_STORAGE_DEVICE_CMD_OFFLINE, span.view());
-    });
-    pmgmt->registerMgmtCallback(MGMT_EVENT_LIFECYCLE_MESSAGE, &mgmt_lifecycle_msg_callback);
-
-    ink_set_thread_name("[TS_MAIN]");
-
-    Note("traffic server running");
-
-#if TS_HAS_TESTS
-    TransformTest::run();
-    //  run_SimpleHttp();
-    run_RegressionTest();
-#endif
-
-    if (getenv("PROXY_AUTO_EXIT")) {
-      eventProcessor.schedule_in(new AutoStopCont(), HRTIME_SECONDS(atoi(getenv("PROXY_AUTO_EXIT"))));
-    }
-  }
-
-#if !TS_USE_POSIX_CAP
-  if (admin_user_p) {
-    change_uid_gid(user);
-  }
-#endif
-
-  TSSystemState::initialization_done();
-
-  while (!TSSystemState::is_event_system_shut_down()) {
-    sleep(1);
-  }
-
-  delete main_thread;
+  return i * i;
 }
+
+// 使用operator[]读取元素，依次存入1-6的平方
+static void bench_array_operator(benchmark::State& state)
+{
+  std::array<int, len> arr;
+  constexpr int i = 1;
+  for (auto _: state) {
+    arr[0] = my_pow(i);
+    arr[1] = my_pow(i+1);
+    arr[2] = my_pow(i+2);
+    arr[3] = my_pow(i+3);
+    arr[4] = my_pow(i+4);
+    arr[5] = my_pow(i+5);
+  }
+}
+BENCHMARK(bench_array_operator);
+
+void test_put() {
+  CacheKey key;
+  Vol *vol = theCache->key_to_vol(&key, "example.com", sizeof("example.com") - 1);
+  RamCache *cache = new_RamCacheLRU();
+  std::vector<Ptr<IOBufferData>> data;
+  int64_t cache_size = 1LL << 28;
+  cache->init(cache_size, vol);
+
+  for (int l = 0; l < 10; l++) {
+    for (int i = 0; i < 200; i++) {
+      IOBufferData *d = THREAD_ALLOC(ioDataAllocator, this_thread());
+      CryptoHash hash;
+
+      d->alloc(BUFFER_SIZE_INDEX_16K);
+      data.push_back(make_ptr(d));
+      hash.u64[0] = (static_cast<uint64_t>(i) << 32) + i;
+      hash.u64[1] = (static_cast<uint64_t>(i) << 32) + i;
+      cache->put(&hash, data[i].get(), 1 << 15);
+      // More hits for the first 10.
+      for (int j = 0; j <= i && j < 10; j++) {
+        Ptr<IOBufferData> data;
+        CryptoHash hash;
+
+        hash.u64[0] = (static_cast<uint64_t>(j) << 32) + j;
+        hash.u64[1] = (static_cast<uint64_t>(j) << 32) + j;
+        cache->get(&hash, &data);
+      }
+    }
+  }
+
+}
+
+static void BM_SomeFunction(benchmark::State& state) {
+  // Perform setup here
+  for (auto _ : state) {
+    // This code gets timed
+    test_put();
+  }
+}
+BENCHMARK(BM_SomeFunction);
+BENCHMARK_MAIN();
+
+
 
 static void mgmt_restart_shutdown_callback(ts::MemSpan<void>)
 {

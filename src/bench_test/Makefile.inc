@@ -91,7 +91,8 @@ bench_test_bench_test_LDADD = \
 	@OPENSSL_LIBS@ \
 	@YAMLCPP_LIBS@ \
 	@BORINGOCSP_LIBS@ \
-	-lm
+	-lm \
+	-lbenchmark
 
 if IS_DARWIN
 bench_test_bench_test_LDADD += $(LUAJIT_DARWIN_LDFLAGS)
