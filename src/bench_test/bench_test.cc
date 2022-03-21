@@ -1754,34 +1754,34 @@ BENCHMARK(bench_array_operator);
 
 void test_put() {
   CacheKey key;
-  Vol *vol = theCache->key_to_vol(&key, "example.com", sizeof("example.com") - 1);
+  //Vol *vol = theCache->key_to_vol(&key, "example.com", sizeof("example.com") - 1);
   RamCache *cache = new_RamCacheLRU();
-  std::vector<Ptr<IOBufferData>> data;
   int64_t cache_size = 1LL << 28;
-  cache->init(cache_size, vol);
+  cache->init(cache_size, nullptr);
 
   for (int l = 0; l < 10; l++) {
     for (int i = 0; i < 200; i++) {
+      //IOBufferData *d = new IOBufferData();
       IOBufferData *d = THREAD_ALLOC(ioDataAllocator, this_thread());
-      CryptoHash hash;
-
       d->alloc(BUFFER_SIZE_INDEX_16K);
-      data.push_back(make_ptr(d));
+
+      CryptoHash hash;
+      //d->_data = (char *) malloc(index_to_buffer_size(BUFFER_SIZE_INDEX_16K));
       hash.u64[0] = (static_cast<uint64_t>(i) << 32) + i;
       hash.u64[1] = (static_cast<uint64_t>(i) << 32) + i;
-      cache->put(&hash, data[i].get(), 1 << 15);
-      // More hits for the first 10.
-      for (int j = 0; j <= i && j < 10; j++) {
-        Ptr<IOBufferData> data;
-        CryptoHash hash;
-
-        hash.u64[0] = (static_cast<uint64_t>(j) << 32) + j;
-        hash.u64[1] = (static_cast<uint64_t>(j) << 32) + j;
-        cache->get(&hash, &data);
-      }
+      //this_thread()->ioDataAllocator;
+      //cache->put(&hash, d, 1 << 15);
+//      // More hits for the first 10.
+//      for (int j = 0; j <= i && j < 10; j++) {
+//        Ptr<IOBufferData> data;
+//        CryptoHash hash;
+//
+//        hash.u64[0] = (static_cast<uint64_t>(j) << 32) + j;
+//        hash.u64[1] = (static_cast<uint64_t>(j) << 32) + j;
+//        cache->get(&hash, &data);
+//      }
     }
   }
-
 }
 
 static void BM_SomeFunction(benchmark::State& state) {
@@ -1792,7 +1792,92 @@ static void BM_SomeFunction(benchmark::State& state) {
   }
 }
 BENCHMARK(BM_SomeFunction);
-BENCHMARK_MAIN();
+int
+main(int argc , const char **argv)
+{
+#if TS_HAS_PROFILER
+  HeapProfilerStart("/tmp/ts.hprof");
+  ProfilerStart("/tmp/ts.prof");
+#endif
+  bool admin_user_p = false;
+
+#if defined(DEBUG) && defined(HAVE_MCHECK_PEDANTIC)
+  mcheck_pedantic(NULL);
+#endif
+
+  pcre_malloc = ats_malloc;
+  pcre_free   = ats_free;
+
+  // Define the version info
+  appVersionInfo.setup(PACKAGE_NAME, "traffic_server", PACKAGE_VERSION, __DATE__, __TIME__, BUILD_MACHINE, BUILD_PERSON, "");
+
+  runroot_handler(argv);
+  // Before accessing file system initialize Layout engine
+  Layout::create();
+  // Let's be clear on what exactly is starting up.
+  printf("Traffic Server " PACKAGE_VERSION BUILD_NUMBER " " __DATE__ " " __TIME__ " " BUILD_MACHINE "\n");
+  chdir_root(); // change directory to the install root of traffic server.
+
+  ink_freelist_init_ops(cmd_disable_freelist, cmd_disable_pfreelist);
+  diagsConfig = new DiagsConfig("Server", DEFAULT_DIAGS_LOG_FILENAME, error_tags, action_tags, false);
+  diags->set_std_output(StdStream::STDOUT, bind_stdout);
+  diags->set_std_output(StdStream::STDERR, bind_stderr);
+  // Bind stdout and stderr to specified switches
+  // Still needed despite the set_std{err,out}_output() calls later since there are
+  // fprintf's before those calls
+  bind_outputs(bind_stdout, bind_stderr);
+  //IOBufferData *d = THREAD_ALLOC(ioDataAllocator, this_thread());
+
+  // Local process manager
+  initialize_process_manager();
+
+  // Set the core limit for the process
+  init_core_size();
+  init_system();
+
+  // Adjust system and process settings
+  adjust_sys_settings();
+
+  // Restart syslog now that we have configuration info
+  syslog_log_configure();
+
+  // init huge pages
+  int enabled;
+  REC_ReadConfigInteger(enabled, "proxy.config.allocator.hugepages");
+  ats_hugepage_init(enabled);
+  Debug("hugepages", "ats_pagesize reporting %zu", ats_pagesize());
+  Debug("hugepages", "ats_hugepage_size reporting %zu", ats_hugepage_size());
+
+  if (!num_accept_threads) {
+    REC_ReadConfigInteger(num_accept_threads, "proxy.config.accept_threads");
+  }
+
+  if (!num_task_threads) {
+    REC_ReadConfigInteger(num_task_threads, "proxy.config.task_threads");
+  }
+
+  ats_scoped_str user(MAX_LOGIN + 1);
+
+  *user        = '\0';
+  admin_user_p = ((REC_ERR_OKAY == REC_ReadConfigString(user, "proxy.config.admin.user_id", MAX_LOGIN)) && (*user != '\0') &&
+                  (0 != strcmp(user, "#-1")));
+
+  Thread *main_thread = new EThread;
+  main_thread->set_specific();
+
+
+  ink_event_system_init(ts::ModuleVersion(1, 0, ts::ModuleVersion::PRIVATE));
+  ink_net_init(ts::ModuleVersion(1, 0, ts::ModuleVersion::PRIVATE));
+  ink_aio_init(ts::ModuleVersion(1, 0, ts::ModuleVersion::PRIVATE));
+  ink_cache_init(ts::ModuleVersion(1, 0, ts::ModuleVersion::PRIVATE));
+  printf("-------------------using root directory------------ \n" );
+  IOBufferData *e = THREAD_ALLOC(ioDataAllocator, this_thread());
+  e->alloc(BUFFER_SIZE_INDEX_16K);
+
+  ::benchmark::Initialize(&argc, const_cast<char**>(argv));
+  ::benchmark::RunSpecifiedBenchmarks();
+  printf("-------------------using root directory------------ \n" );
+}
 
 
 
