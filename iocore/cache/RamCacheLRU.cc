@@ -130,13 +130,13 @@ RamCacheLRU::get(CryptoHash *key, Ptr<IOBufferData> *ret_data, uint64_t auxkey)
       lru.enqueue(e);
       (*ret_data) = e->data;
       DDebug("ram_cache", "get %X %" PRIu64 " HIT", key->slice32(3), auxkey);
-      CACHE_SUM_DYN_STAT_THREAD(cache_ram_cache_hits_stat, 1);
+      //CACHE_SUM_DYN_STAT_THREAD(cache_ram_cache_hits_stat, 1);
       return 1;
     }
     e = e->hash_link.next;
   }
   DDebug("ram_cache", "get %X %" PRIu64 " MISS", key->slice32(3), auxkey);
-  CACHE_SUM_DYN_STAT_THREAD(cache_ram_cache_misses_stat, 1);
+  //CACHE_SUM_DYN_STAT_THREAD(cache_ram_cache_misses_stat, 1);
   return 0;
 }
 
@@ -195,7 +195,7 @@ RamCacheLRU::put(CryptoHash *key, IOBufferData *data, uint32_t len, bool, uint64
   lru.enqueue(e);
   bytes += ENTRY_OVERHEAD + data->block_size();
   objects++;
-  CACHE_SUM_DYN_STAT_THREAD(cache_ram_cache_bytes_stat, ENTRY_OVERHEAD + data->block_size());
+  //CACHE_SUM_DYN_STAT_THREAD(cache_ram_cache_bytes_stat, ENTRY_OVERHEAD + data->block_size());
   while (bytes > max_bytes) {
     RamCacheLRUEntry *ee = lru.dequeue();
     if (ee) {
