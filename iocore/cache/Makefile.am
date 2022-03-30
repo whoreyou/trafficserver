@@ -58,6 +58,7 @@ libinkcache_a_SOURCES = \
 	P_RamCache.h \
 	RamCacheCLFUS.cc \
 	RamCacheLRU.cc \
+	RamCacheLRUPMem.cc \
 	Store.cc
 
 if BUILD_TESTS
